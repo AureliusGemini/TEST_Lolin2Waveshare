@@ -4,10 +4,10 @@
 
 // --- CONFIGURATION ---
 // TARGET: Waveshare S3 Nano (Hub)
-// MAC: A0:85:E3:E1:2E:70
+// MAC Address: A0:85:E3:E1:2E:70
 uint8_t hubMacAddress[] = {0xA0, 0x85, 0xE3, 0xE1, 0x2E, 0x70};
 
-// Must match the structure in the Hub code
+// Message Structure (Must match Hub)
 typedef struct struct_message
 {
     char command[32];
@@ -16,10 +16,10 @@ typedef struct struct_message
 struct_message myData;
 esp_now_peer_info_t peerInfo;
 
-// Callback to see if Hub received the packet
+// Callback: Did the Hub receive the message?
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
 {
-    Serial.print("\r\nLast Packet Send Status:\t");
+    Serial.print("\r\nPacket Status:\t");
     Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
 }
 
@@ -48,7 +48,7 @@ void setup()
     }
 
     Serial.println("--- REMOTE READY ---");
-    Serial.println("Type 't' in Serial Monitor to toggle pump.");
+    Serial.println("Type 't' to toggle pump, 'on' for ON, 'off' for OFF.");
 }
 
 void loop()
