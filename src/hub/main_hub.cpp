@@ -3,107 +3,163 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include <BH1750.h>
-#include <esp_now.h>
 #include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <WiFiManager.h>
+
+// IMPORT SECRETS
+#include "secrets.h"
 
 // --- PIN CONFIGURATION ---
 #define PIN_SDA 11
 #define PIN_SCL 12
 #define PIN_RAIN_DIGITAL 10
 #define PIN_FERT_LEVEL 14
+#define PIN_PUMP 4
 
-// !!! MOVED TO GPIO 4 (Safer than GPIO 0) !!!
-#define PIN_PUMP_RELAY 4
-
-#define PIN_TX_TO_SCREEN 44
-#define PIN_RX_FROM_SCREEN 43
-
-// --- SECURITY: AUTHORIZED REMOTE ---
-const uint8_t remoteMac[] = {0x58, 0xBF, 0x25, 0x12, 0xD6, 0x88};
-
+// --- OBJECTS ---
 Adafruit_BME280 bme;
 BH1750 lightMeter;
-HardwareSerial ScreenSerial(1);
+WiFiManager wm;
 
-typedef struct struct_message
-{
-    char command[32];
-} struct_message;
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
 
-void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len)
-{
-    if (memcmp(mac, remoteMac, 6) != 0)
-        return;
+// --- TIMERS ---
+unsigned long lastSensorRead = 0;
+unsigned long lastDbRead = 0;
 
-    struct_message *msg = (struct_message *)incomingData;
-    Serial.print("Command: ");
-    Serial.println(msg->command);
-
-    // --- LOGIC FIXED FOR ACTIVE LOW RELAY ---
-    // ON  = LOW
-    // OFF = HIGH
-
-    if (strcmp(msg->command, "TOGGLE_PUMP") == 0)
-    {
-        int state = digitalRead(PIN_PUMP_RELAY);
-        digitalWrite(PIN_PUMP_RELAY, !state); // Flip state
-        // Log the human-readable status
-        Serial.println(!state == LOW ? "Action: Pump ON" : "Action: Pump OFF");
-    }
-    else if (strcmp(msg->command, "PUMP_ON") == 0)
-    {
-        digitalWrite(PIN_PUMP_RELAY, LOW); // LOW IS ON
-        Serial.println("Action: Pump ON");
-    }
-    else if (strcmp(msg->command, "PUMP_OFF") == 0)
-    {
-        digitalWrite(PIN_PUMP_RELAY, HIGH); // HIGH IS OFF
-        Serial.println("Action: Pump OFF");
-    }
-}
+// NEW: Timer to prevent DB from overwriting manual toggle
+unsigned long ignoreDbUntil = 0;
 
 void setup()
 {
     Serial.begin(115200);
-    ScreenSerial.begin(115200, SERIAL_8N1, PIN_RX_FROM_SCREEN, PIN_TX_TO_SCREEN);
 
-    pinMode(PIN_RAIN_DIGITAL, INPUT);
+    // 1. PIN INIT
+    // Rain: Fake "Wet" by connecting D10 to GND
+    pinMode(PIN_RAIN_DIGITAL, INPUT_PULLUP);
+
+    // Fert: Float Switch (Pin 14 to GND)
     pinMode(PIN_FERT_LEVEL, INPUT_PULLUP);
 
-    pinMode(PIN_PUMP_RELAY, OUTPUT);
-    // START HIGH so the pump stays OFF when booting
-    digitalWrite(PIN_PUMP_RELAY, HIGH);
+    // Pump: Active LOW Relay (LOW = ON)
+    pinMode(PIN_PUMP, OUTPUT);
+    digitalWrite(PIN_PUMP, LOW); // Default OFF
 
+    // 2. SENSORS INIT
     Wire.begin(PIN_SDA, PIN_SCL);
     if (!bme.begin(0x76))
         Serial.println("Warning: BME280 not found");
     if (!lightMeter.begin(BH1750::CONTINUOUS_HIGH_RES_MODE))
         Serial.println("Warning: BH1750 not found");
 
-    WiFi.mode(WIFI_STA);
-    if (esp_now_init() == ESP_OK)
+    // 3. WIFI MANAGER
+    bool res = wm.autoConnect("GreenGuardian_Setup");
+    if (!res)
     {
-        esp_now_register_recv_cb(OnDataRecv);
-        Serial.println("Hub Ready.");
+        Serial.println("Failed to connect");
+        ESP.restart();
     }
+
+    // 4. FIREBASE INIT
+    config.api_key = API_KEY;
+    config.database_url = DATABASE_URL;
+    config.signer.tokens.legacy_token = DATABASE_SECRET;
+    Firebase.begin(&config, &auth);
+    Firebase.reconnectWiFi(true);
 }
 
 void loop()
 {
-    float t = bme.readTemperature();
-    float h = bme.readHumidity();
-    float p = bme.readPressure() / 100.0F;
-    float l = lightMeter.readLightLevel();
-    int rain = digitalRead(PIN_RAIN_DIGITAL);
-    int fert = digitalRead(PIN_FERT_LEVEL);
+    // --- 1. MANUAL TOGGLE (FIXED) ---
+    if (Serial.available())
+    {
+        char c = Serial.read();
+        if (c == 't' || c == 'T')
+        {
+            // 1. Flip Physical State
+            int current = digitalRead(PIN_PUMP);
+            int newState = !current;
+            digitalWrite(PIN_PUMP, newState);
 
-    String packet = "T=" + String(t, 1) +
-                    ";H=" + String(h, 0) +
-                    ";P=" + String(p, 0) +
-                    ";L=" + String(l, 0) +
-                    ";R=" + String(rain) +
-                    ";F=" + String(fert) + ";\n";
+            Serial.print("\n[MANUAL] Toggled Pump to: ");
+            Serial.println(newState == LOW ? "ON" : "OFF");
 
-    ScreenSerial.print(packet);
-    delay(1000);
+            // 2. Tell Firebase the new state
+            if (Firebase.ready())
+            {
+                bool dbState = (newState == LOW); // LOW = ON
+                Firebase.RTDB.setBool(&fbdo, "/MCU/sensors/water_pump_is_on", dbState);
+            }
+
+            // 3. CRITICAL FIX: Ignore Database "Read" for 3 seconds
+            // This prevents the DB from instantly turning it back off
+            ignoreDbUntil = millis() + 3000;
+        }
+    }
+
+    // --- 2. READ PUMP COMMAND FROM DB ---
+    // Only run if we are NOT currently ignoring the DB
+    if (millis() > ignoreDbUntil)
+    {
+        if (Firebase.ready() && (millis() - lastDbRead > 1000))
+        {
+            lastDbRead = millis();
+
+            if (Firebase.RTDB.getBool(&fbdo, "/MCU/sensors/water_pump_is_on"))
+            {
+                bool shouldBeOn = fbdo.boolData();
+                int targetPinState = shouldBeOn ? LOW : HIGH;
+
+                // Only write if different (prevents glitching)
+                if (digitalRead(PIN_PUMP) != targetPinState)
+                {
+                    digitalWrite(PIN_PUMP, targetPinState);
+                    Serial.print("[CLOUD] Pump Updated: ");
+                    Serial.println(shouldBeOn ? "ON" : "OFF");
+                }
+            }
+        }
+    }
+
+    // --- 3. SENSOR READ & UPLOAD (Every 2 Seconds) ---
+    if (millis() - lastSensorRead > 2000)
+    {
+        lastSensorRead = millis();
+
+        // Read Sensors
+        float t = bme.readTemperature();
+        float h = bme.readHumidity();
+        float p = bme.readPressure() / 100.0F;
+        float l = lightMeter.readLightLevel();
+
+        // Logic: LOW (0) means Connected to GND (Wet/Full)
+        bool isRainWet = (digitalRead(PIN_RAIN_DIGITAL) == LOW);
+        bool isFertFull = (digitalRead(PIN_FERT_LEVEL) == LOW);
+        bool isPumpOn = (digitalRead(PIN_PUMP) == LOW);
+
+        // Print Status
+        Serial.println("\n--- STATUS ---");
+        Serial.print("Rain (D10): ");
+        Serial.println(isRainWet ? "WET (GND Connected)" : "DRY (Open)");
+        Serial.print("Pump (D4):  ");
+        Serial.println(isPumpOn ? "ON (Low)" : "OFF (High)");
+
+        // Upload
+        if (Firebase.ready())
+        {
+            FirebaseJson json;
+            json.set("temperature", t);
+            json.set("humidity", h);
+            json.set("pressure", p);
+            json.set("lux", l);
+            json.set("rain_detected", isRainWet);
+            json.set("fertilizer_full", isFertFull);
+            json.set("water_pump_is_on", isPumpOn);
+
+            Firebase.RTDB.setJSON(&fbdo, "/MCU/sensors", &json);
+        }
+    }
 }
